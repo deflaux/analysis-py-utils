@@ -219,3 +219,5 @@ passed into the `_reformat_query` function called `print_before_and_after`
 that's False by default, but if you set it to True, it will automatically print
 out your query as it's passed in to the function, then again after we tried to
 reformat it, so that might be helpful for debugging.
+
+You can [![Open this repo in Google Cloud Shell](http://gstatic.com/cloudssh/images/open-btn.png)](https://console.cloud.google.com/cloudshell/open?git_repo=https://github.com/deflaux/analysis-py-utils&page=editor&open_in_editor=README.md) if you like when working on additional logic to reformat queries for execution by SQLite.
