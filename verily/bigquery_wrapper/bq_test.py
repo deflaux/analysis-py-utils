@@ -1,4 +1,4 @@
-# Copyright 2017 Verily Life Sciences Inc. All Rights Reserved.
+# Copyright 2019 Verily Life Sciences Inc. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,35 +13,30 @@
 # limitations under the License.
 """Unit tests for the bq library."""
 
+# Workaround for https://github.com/GoogleCloudPlatform/google-cloud-python/issues/2366
 from __future__ import absolute_import
 
+import cStringIO
+import csv
 import random
+import uuid
 
 from ddt import data, ddt, unpack
-from google.cloud import bigquery, storage
+from google.cloud import storage
+from google.cloud.bigquery import ExtractJob
 from google.cloud.bigquery.schema import SchemaField
+from mock import patch, PropertyMock
 
-from verily.bigquery_wrapper import bq, bq_test_case
-
-LONG_TABLE_LENGTH = 200000
+from verily.bigquery_wrapper import bq_shared_tests, bq_test_case
 
 
 @ddt
-class BQTest(bq_test_case.BQTestCase):
+class BQTest(bq_shared_tests.BQSharedTests):
     @classmethod
     def create_mock_tables(cls):
         # type: () -> None
         """Create mock tables"""
-        cls.src_table_name = cls.table_path('tmp')
-        cls.client.populate_table(cls.src_table_name, [SchemaField('foo', 'INTEGER'),
-                                                       SchemaField('bar', 'INTEGER'),
-                                                       SchemaField('baz', 'INTEGER')],
-                                  [[1, 2, 3], [4, 5, 6]])
-
-        cls.long_table_name = cls.table_path('long_table')
-        cls.client.populate_table(cls.long_table_name, [
-            SchemaField('foo', 'INTEGER'),
-        ], [[1]] * LONG_TABLE_LENGTH)
+        super(BQTest, cls).create_mock_tables()
 
     @classmethod
     def create_temp_bucket(cls):
@@ -73,47 +68,18 @@ class BQTest(bq_test_case.BQTestCase):
         for blob in self.bucket.list_blobs():
             blob.delete()
 
-    def test_get_bq_table_without_dataset(self):
-        # type: () -> None
-        """Test whether an error is raised in _get_bq_table if neither dataset_id or default_dataset
-        is specified"""
-        client_without_dataset = bq.Client(self.TEST_PROJECT)
-        with self.assertRaises(ValueError):
-            client_without_dataset._get_bq_table(self.src_table_name, None)
+    def test_add_rows_repeated(self):
+        table_name = self.src_table_name + '_for_append_repeated'
+        self.client.populate_table(table_name,
+                                   [SchemaField('foo', 'INTEGER'),
+                                    SchemaField('bar', 'INTEGER', mode='REPEATED')],
+                                   [[1, [2, 3]], [4, [5, 6]]], make_immediately_available=False)
 
-    def test_get_bq_table(self):
-        # type: () -> None
-        """Test _get_bq_table"""
-        project_id, dataset_id, table_name = self.client.parse_table_path(self.src_table_name)
-        expected_table_id = '{}:{}.{}'.format(project_id, dataset_id, table_name)
+        self.client.append_rows(table_name, [[7, [8, 9]]])
 
-        src_table = self.client._get_bq_table(table_name, dataset_id, project_id)
-        self.client.reload_table(src_table)
-
-        self.assertEqual(src_table.table_id, expected_table_id)
-
-    def test_load_data(self):
-        # type: () -> None
-        """Test bq.Client.get_query_results"""
-        result = self.client.get_query_results('SELECT * FROM `' + self.src_table_name + '`')
-        self.assertTrue((result == [(1, 2, 3), (4, 5, 6)]) or (result == [(4, 5, 6), (1, 2, 3)]))
-
-    @data((500, 500, 'max_results < 10k'), (100000, 100000, 'max_results == 10k'),
-          (100001, 100001, 'max_results > 10k'), (LONG_TABLE_LENGTH * 2, LONG_TABLE_LENGTH,
-                                                  'max_results > total_rows'), (
-                                                      None, LONG_TABLE_LENGTH, 'Load all rows'))
-    @unpack
-    def test_load_large_data(self, max_results, expected_length, test_description):
-        # type: (int, int, str) -> None
-        """Test using bq.Client.get_query_results to load very large data
-        Args:
-            max_results: Maximum number of results to return
-            expected_length: Expected length of results to return
-        """
-        result = self.client.get_query_results(
-            'SELECT * FROM `' + self.long_table_name + '`', max_results=max_results)
-
-        self.assertEqual(len(result), expected_length, test_description)
+        self.assertEqual([(1, [2, 3]), (4, [5, 6]), (7, [8, 9])].sort(),
+                         self.client.get_query_results('SELECT * FROM `{}`'.format(table_name))
+                         .sort())
 
     @data(('invalid format', True, 'Invalid output_format'), ('avro', True, 'GZIP Avro format'))
     @unpack
@@ -130,20 +96,23 @@ class BQTest(bq_test_case.BQTestCase):
             self.client.export_table_to_bucket(self.src_table_name, self.temp_bucket_name,
                                                'dummy_file', out_fmt, compression)
 
-    # TODO: Add test to export tables from a project different from self.client.project_id
-    @data(('csv', True, '', '', 'tmp.csv.gz', 'csv w/ gzip'),
-          ('json', True, 'test', '', 'test/tmp.json.gz', 'json w/ gzip'),
-          ('avro', False, '/test', '', 'test/tmp.avro', 'Avro w/o gzip'),
-          ('csv', True, '', 'ext', 'tmp_ext.csv.gz', 'csv w/ gzip & ext'))
+    # TODO (Issue 8): Add test to export tables from a project different from self.client.project_id
+    @data(('csv', True, '', '', None, 'tmp-000000000000.csv.gz', True, 'csv w/ gzip'),
+          ('json', True, 'test', '', None, 'test/tmp-000000000000.json.gz', True, 'json w/ gzip'),
+          ('avro', False, '/test', '', None, 'test/tmp.avro', False, 'Avro w/o gzip'),
+          ('csv', True, '', 'ext', None, 'tmp_ext.csv.gz', False, 'csv w/ gzip & ext'),
+          ('csv', True, '', '', 'overwritten_name', 'overwritten_name.csv.gz', False, 'overwriting filename'))  # noqa
     @unpack
     def test_export_table(self,
-                          out_fmt, # type: str
-                          compression, # type: bool
-                          dir_in_bucket, # type: str
-                          output_ext, # type: str
-                          expected_output_path, # type: str
-                          test_description # type: str
-    ):
+                          out_fmt,  # type: str
+                          compression,  # type: bool
+                          dir_in_bucket,  # type: str
+                          output_ext,  # type: str
+                          explicit_filename,  # type: str
+                          expected_output_path,  # type: str
+                          support_multifile_export,  # type: bool
+                          test_description  # type: str
+                          ):
         # type: (...) -> None
         """Test ExportTableToBucket
         Args:
@@ -151,142 +120,139 @@ class BQTest(bq_test_case.BQTestCase):
             compression: Whether to compress file using GZIP. Cannot be applied to avro
             dir_in_bucket: The directory in the bucket to store the output files
             output_ext: Extension of the output file name
+            explicit_filename: Explicitly specified filename.
             expected_output_path: Expected output path
             test_description: A description of the test
         """
 
-        self.client.export_table_to_bucket(self.src_table_name, self.temp_bucket_name,
-                                           dir_in_bucket, out_fmt, compression, output_ext)
+        fnames = self.client.export_table_to_bucket(
+            self.src_table_name, self.temp_bucket_name, dir_in_bucket, out_fmt, compression,
+            output_ext, support_multifile_export=support_multifile_export,
+            explicit_filename=explicit_filename)
 
+        # Test that the output file name is returned (everything after the last "/" of the path).
+        self.assertEqual(fnames, [expected_output_path.rsplit('/', 1)[-1]])
+
+        # Test that the object is in the bucket.
         self.assertTrue(
-            isinstance(self.bucket.get_blob(expected_output_path), storage.Blob), test_description)
+                isinstance(self.bucket.get_blob(expected_output_path), storage.Blob),
+                           test_description +
+                           ': File {} is not in {}'.format(expected_output_path,
+                                                           str([x for x in self.bucket.list_blobs()])))
 
-    # TODO: Add test to export schemas from a project different from self.client.project_id
-    @data(('', '', 'tmp-schema.json', 'Export schema to root'),
-          ('test', '', 'test/tmp-schema.json', 'Export schema to /test'),
-          ('', 'ext', 'tmp_ext-schema.json', 'Export schema to root with extension'))
+    def test_export_table_multifile(self):
+        """Test correct filenames returned for export with multiple files created."""
+        with patch.object(ExtractJob, 'destination_uri_file_counts',
+                          new_callable=PropertyMock) as file_counts_mock:
+            file_counts_mock.return_value = [2]
+            fnames = self.client.export_table_to_bucket(
+                self.src_table_name, self.temp_bucket_name, support_multifile_export=True)
+            self.assertSetEqual(set(fnames), {'tmp-000000000000.csv', 'tmp-000000000001.csv'})
+
+    @data(('csv', True, '', '', 'tmp-000000000000.csv.gz', 'csv w/ gzip', True),
+          ('json', True, 'test', '', 'test/tmp-000000000000.json.gz', 'json w/ gzip', False),
+          ('avro', False, 'test', '', 'test/tmp-000000000000.avro', 'Avro w/o gzip', False),
+          ('csv', True, '', 'ext', 'tmp_ext-000000000000.csv.gz', 'csv w/ gzip & ext', True))
     @unpack
-    def test_export_schema(self, dir_in_bucket, output_ext, expected_schema_path, test_description):
+    def test_import_table_from_bucket(self,
+                                      input_fmt,  # type: str
+                                      compression,  # type: bool
+                                      dir_in_bucket,  # type: str
+                                      output_ext,  # type: str
+                                      input_path,  # type: str
+                                      test_description,  # type: str
+                                      skip_leading_row,  # type: bool
+                                    ):
+        # type: (...) -> None
+        """Test ImportTableFromBucket
+        Note this test is dependent on export_table_to_bucket working correctly.
+
+        Args:
+            input_fmt: Input format. Must be one of {'csv', 'json', 'avro'}
+            compression: Whether to compress file using GZIP. Cannot be applied to avro
+            dir_in_bucket: The directory in the bucket to store the output files
+            output_ext: Extension of the output file name
+            expected_output_path: Expected output path
+            test_description: A description of the test
+            skip_leading_row: Whether to skip the leading row in the data file
+        """
+        self.client.export_table_to_bucket(self.src_table_name, self.temp_bucket_name,
+                                           dir_in_bucket, input_fmt, compression, output_ext)
+
+        input_path = 'gs://{}/{}'.format(self.temp_bucket_name, input_path)
+
+        dest_path = self.client.path(str(uuid.uuid4().hex))
+
+        self.client.import_table_from_bucket(dest_path,
+                                             input_path,
+                                             input_format=input_fmt,
+                                             schema=bq_shared_tests.FOO_BAR_BAZ_INTEGERS_SCHEMA,
+                                             skip_leading_row=skip_leading_row)
+
+        results = self.client.get_query_results('SELECT * FROM `{}`'.format(dest_path))
+        self.assertItemsEqual([(1, 2, 3), (4, 5, 6)], results)
+
+    def test_import_table_from_file(self):
+        data = [(8, 9, 10), (11, 12, 13)]
+        output = cStringIO.StringIO()
+
+        csv_out = csv.writer(output)
+        for row in data:
+            csv_out.writerow(row)
+        output.seek(0)
+
+        dest_path = self.client.path(str(uuid.uuid4().hex))
+
+        self.client.import_table_from_file(dest_path,
+                                           output,
+                                           input_format='csv',
+                                           schema=bq_shared_tests.FOO_BAR_BAZ_INTEGERS_SCHEMA)
+
+        results = self.client.get_query_results('SELECT * FROM `{}`'.format(dest_path))
+        self.assertItemsEqual(data, results)
+
+    # TODO(Issue 7): Add test to export schemas from a project different from self.client.project_id
+    @data(('', '', None, 'tmp-schema.json', 'Export schema to root'),
+          ('test', '', None, 'test/tmp-schema.json', 'Export schema to /test'),
+          ('', 'ext', None, 'tmp_ext-schema.json', 'Export schema to root with extension'),
+          ('', '', 'overwritten_name', 'overwritten_name-schema.json', 'overwrite filename'))
+    @unpack
+    def test_export_schema(self,
+                           dir_in_bucket,  # type: str
+                           output_ext,  # type: str
+                           explicit_filename,  # type: str
+                           expected_schema_path,  # type: str
+                           test_description  # type:str
+                           ):
         # type: (str, str, str, str) -> None
         """Test ExportSchemaToBucket
          Args:
             dir_in_bucket: The directory in the bucket to store the output files
             output_ext: Extension of the output file name
+            explicit_filename: Explicitly specified filename.
             expected_output_path: Expected output path
             test_description: A description of the test
         """
 
-        self.client.export_schema_to_bucket(self.src_table_name,
-                                            self.temp_bucket_name, dir_in_bucket, output_ext)
+        fname = self.client.export_schema_to_bucket(self.src_table_name, self.temp_bucket_name,
+                                                    dir_in_bucket, output_ext,
+                                                    explicit_filename=explicit_filename)
 
+        # Test that the output file name is returned (everything after the last "/" of the path).
+        self.assertEqual(fname, expected_schema_path.rsplit('/', 1)[-1])
+
+        # Test that the object is in the bucket.
         self.assertTrue(
-            isinstance(self.bucket.get_blob(expected_schema_path), storage.Blob), test_description)
+                isinstance(self.bucket.get_blob(expected_schema_path), storage.Blob),
+                test_description)
 
-    def test_create_table_from_query(self):
-        # type: () -> None
-        """Test bq.Client.CreateTablesFromQuery"""
-        dest_table = self.table_path('tmp2')
-        self.client.create_table_from_query('SELECT * FROM `' + self.src_table_name
-                                            + '`', dest_table)
-        result = self.client.get_query_results('SELECT * FROM `' + dest_table + '`')
-        self.assertTrue((result == [(1, 2, 3), (4, 5, 6)]) or (result == [(4, 5, 6), (1, 2, 3)]))
-        self.client.delete_table_by_name(dest_table)
+    def test_invalid_query_prints_query(self):
+        """Test get_query_results prints the query if given an invalid query"""
+        query = 'this is an invalid query!'
+        with self.assertRaises(RuntimeError) as e:
+            self.client.get_query_results(query)
+        self.assertTrue(query in str(e.exception))
 
-    def test_delete_dataset_with_tables_raises(self):
-        # type: () -> None
-        """Test that deleting a dataset with existing tables will raise an exception."""
-        dest_table = self.table_path('tmp2')
-        self.client.create_table_from_query('SELECT * FROM `'
-                                            + self.src_table_name + '`', dest_table)
-
-        with self.assertRaises(Exception):
-            self.client.delete_dataset_by_name(self.dataset_name)
-
-    def test_force_delete_dataset_with_tables(self):
-        # type: () -> None
-        """Test that we can use DeleteDataset to delete all the tables and the dataset. """
-        temp_dataset_name = self.dataset_name + 'dataset_with_tables'
-        self.client.create_dataset_by_name(temp_dataset_name)
-        dest_table = self.table_path('to_be_deleted', dataset_name=temp_dataset_name)
-        self.client.create_table_from_query('SELECT * FROM `'
-                                            + self.src_table_name + '`', dest_table)
-
-        self.client.delete_dataset_by_name(temp_dataset_name, True)
-        self.assertTrue(temp_dataset_name not in self.client.get_datasets())
-
-    def test_path(self):
-        # type: () -> None
-        """Test bq.Client.Parsetable_path"""
-        table_name = 'my_table'
-        table_path = '{}.{}.{}'.format(self.TEST_PROJECT, self.dataset_name, table_name)
-        mock_path = '{}.{}.{}'.format('my_project', 'my_dataset', table_name)
-        self.assertEqual(table_path, self.client.path('my_table'))
-        self.assertEqual(table_path, self.client.path(self.dataset_name + '.' + table_name))
-        self.assertEqual(table_path, self.client.path(table_path))
-        self.assertEqual(mock_path, self.client.path(table_name, dataset_id='my_dataset',
-                                                     project_id='my_project'))
-
-        self.assertEqual((self.TEST_PROJECT, self.dataset_name, table_name),
-                         self.client.parse_table_path(table_path))
-        self.assertEqual((self.TEST_PROJECT, self.dataset_name, table_name),
-                         self.client.parse_table_path(self.dataset_name + '.' + table_name))
-        self.assertEqual((self.TEST_PROJECT, self.dataset_name, table_name),
-                         self.client.parse_table_path(table_name))
-
-    def test_create_tables_from_dict(self):
-        # type: () -> None
-        """Test bq.Client.get_schema"""
-        self.client.create_tables_from_dict({
-            'empty_1':
-            [bigquery.SchemaField('col1', 'INTEGER', mode='REPEATED'),
-             bigquery.SchemaField('col2', 'STRING')],
-            'empty_2':
-            [bigquery.SchemaField('col1', 'FLOAT'), bigquery.SchemaField('col2', 'INTEGER')]
-        })
-        self.assertEqual([('col1', 'INTEGER', 'REPEATED'), ('col2', 'STRING', 'NULLABLE')],
-                         [(x.name, x.field_type, x.mode)
-                          for x in self.client.get_schema(self.dataset_name, 'empty_1')])
-        self.assertEqual([('col1', 'FLOAT', 'NULLABLE'), ('col2', 'INTEGER', 'NULLABLE')],
-                         [(x.name, x.field_type, x.mode)
-                          for x in self.client.get_schema(self.dataset_name, 'empty_2')])
-
-    def test_add_rows_repeated(self):
-        table_name = self.src_table_name + '_for_append_repeated'
-        self.client.populate_table(table_name,
-                                  [SchemaField('foo', 'INTEGER'),
-                                   SchemaField('bar', 'INTEGER', mode='REPEATED')],
-                                  [[1, [2, 3]], [4, [5, 6]]])
-
-        self.client.append_rows(table_name, [[7, [8, 9]]])
-
-        self.assertEqual([(1, [2, 3]), (4, [5, 6]), (7, [8, 9])].sort(),
-                         self.client.get_query_results("SELECT * FROM " + table_name).sort())
-
-    def test_add_rows(self):
-        table_name = self.src_table_name + '_for_append'
-        self.client.populate_table(table_name,
-                                  [SchemaField('foo', 'INTEGER'),
-                                   SchemaField('bar', 'INTEGER'),
-                                   SchemaField('baz', 'INTEGER')],
-                                  [[1, 2, 3], [4, 5, 6]])
-
-        self.client.append_rows(table_name, [[7, 8, 9]])
-
-        self.assertEqual([(1,2,3), (4,5,6), (7,8,9)].sort(),
-                         self.client.get_query_results("SELECT * FROM " + table_name).sort())
-
-    def test_add_rows_bad_schema_raises(self):
-        table_name = self.src_table_name + '_for_append_bad_schema'
-        self.client.populate_table(table_name,
-                                  [SchemaField('foo', 'INTEGER'),
-                                   SchemaField('bar', 'INTEGER'),
-                                   SchemaField('baz', 'INTEGER')],
-                                  [[1, 2, 3], [4, 5, 6]])
-
-        with self.assertRaises(RuntimeError):
-            self.client.append_rows(table_name,
-                                    [[7, 8, 9]],
-                                    [SchemaField('foo', 'INTEGER'), SchemaField('bar', 'INTEGER')])
 
 if __name__ == '__main__':
     bq_test_case.main()

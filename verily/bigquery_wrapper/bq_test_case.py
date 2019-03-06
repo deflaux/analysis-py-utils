@@ -1,4 +1,4 @@
-# Copyright 2017 Verily Life Sciences Inc. All Rights Reserved.
+# Copyright 2019 Verily Life Sciences Inc. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,9 +18,9 @@ down at the end. Subclasses should override create_mock_tables() to create
 temporary tables by calling bq.PopulateTable().
 """
 
+# Workaround for https://github.com/GoogleCloudPlatform/google-cloud-python/issues/2366
 from __future__ import absolute_import
 
-import copy
 import datetime
 import json
 import logging
@@ -28,19 +28,20 @@ import os
 import random
 import sys
 import unittest
+import uuid
 
 import numpy as np
 import pandas as pd
 
 from google.cloud.bigquery.schema import SchemaField
+from typing import Optional
 
 from verily.bigquery_wrapper import bq as real_bq
 try:
-  from verily.bigquery_wrapper import mock_bq
+    from verily.bigquery_wrapper import mock_bq
 except ImportError as e:
     print("***NOTE: Only BigQuery tests will work in this environment:\n\t" + str(e))
 
-from verily.bigquery_wrapper.bq_base import DEFAULT_MAX_API_CALL_TRIES
 from verily.bigquery_wrapper.pandas_utils import safe_read_csv
 
 # We do our best to clean up all the test datasets, but even if something goes wrong
@@ -52,42 +53,64 @@ NP_TYPE_LOOKUP = {'STRING': str, 'INT64': np.int64, 'INTEGER': np.int64, 'DATE':
                   'TIMESTAMP': str, 'FLOAT64': np.float64, 'FLOAT': np.float64, 'BOOL': bool,
                   'BOOLEAN': bool}
 
+SELECT_ALL_FORMAT = 'SELECT * FROM `{}`'
+
 
 class BQTestCase(unittest.TestCase):
     """Provides a client and a temporary dataset for testing SQL queries.
     By default, it will use an acutal BigQuery client. If you pass in
-    use_mocks=True to the setup method, then it will use a mock environment
-    backed by SQLite.
+    use_mocks=True to the setup method, then it will use a mock environment backed by an in-memory
+    database.
     """
+
+    # If the FORCE_USE_REAL_BQ_FOR_TESTS environment variable is set to anything but empty then it
+    # will force all testing BigQuery clients to be real BigQuery, overriding any that are set
+    # to use mock BigQuery.
+    FORCE_USE_REAL_BQ = os.environ.get('FORCE_USE_REAL_BQ_FOR_TESTS')
 
     TEST_PROJECT = os.getenv('TEST_PROJECT')
     tables_created_in_constructor = []
 
     @classmethod
-    def setUpClass(cls, use_mocks=False, default_max_api_call_tries=DEFAULT_MAX_API_CALL_TRIES):
-        cls.use_mocks = use_mocks
-        cls.dataset_name = (datetime.datetime.utcnow().strftime("test_%Y_%m_%d_%H_%M_") +
-                            str(random.SystemRandom().randint(1000, 9999)))
-        if use_mocks:
+    def setUpClass(cls, use_mocks=False, alternate_bq_client_class=None):
+        """Sets up BQ client and creates dataset and tables for testing.
+
+        Args:
+            use_mocks: Whether to use a mock implementation of the client.
+            alternate_bq_client_class:  An alternate class for the real bq.Client class to use
+                instead of Google's bigquery.Client.  The bq.Client class uses an internal
+                instance to communicate with BigQuery; this optional parameter allows the caller
+                to provide an alternate implementation of the Google BigQuery API to be used.
+        """
+        force_use_real_bq = bool(cls.FORCE_USE_REAL_BQ)
+        if force_use_real_bq:
+            log = logging.getLogger("BQTestCase")
+            log.warning('Forcing test to run in real BigQuery.')
+
+        cls.use_mocks = False if force_use_real_bq else use_mocks
+        cls.default_test_dataset_id = (datetime.datetime.utcnow().strftime("test_%Y_%m_%d_%H_%M_") +
+                                       str(random.SystemRandom().randint(1000, 9999)))
+        if cls.use_mocks:
             cls.TEST_PROJECT = 'mock_bq_project'
-            cls.client = mock_bq.Client(cls.TEST_PROJECT, cls.dataset_name)
+            cls.client = mock_bq.Client(cls.TEST_PROJECT, cls.default_test_dataset_id)
         else:
             if cls.TEST_PROJECT is None:
               raise ValueError("Environment variable 'TEST_PROJECT' is not set. "
                                "Set its value to be the project id in which you "
                                "wish to run test queries.")
-            cls.client = real_bq.Client(cls.TEST_PROJECT, cls.dataset_name,
-                                        default_max_api_call_tries=default_max_api_call_tries)
+            cls.client = real_bq.Client(cls.TEST_PROJECT, cls.default_test_dataset_id,
+                                        alternate_bq_client_class=alternate_bq_client_class)
         # Make the tables in the test datasets expire after an hour.
-        cls.client.create_dataset_by_name(cls.dataset_name, expiration_hours=EXPIRATION_HOURS)
+        cls.client.create_dataset_by_name(cls.default_test_dataset_id,
+                                          expiration_hours=EXPIRATION_HOURS)
         cls.create_mock_tables()
 
         # Get the tables present in the class before anything else runs.
-        cls.tables_created_in_constructor.extend(cls.client.tables(cls.dataset_name))
+        cls.tables_created_in_constructor.extend(cls.client.tables(cls.default_test_dataset_id))
 
     def tearDown(self):
         # After each test, delete the tables created apart from class setup.
-        current_tables = self.client.tables(self.dataset_name)
+        current_tables = self.client.tables(self.default_test_dataset_id)
         for table in current_tables:
             if table not in self.tables_created_in_constructor:
                 self.client.delete_table_by_name(table)
@@ -95,36 +118,25 @@ class BQTestCase(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         try:
-            cls.client.delete_dataset_by_name(cls.dataset_name, delete_all_tables=True)
-        # TODO(PM-980): This exception should probably be handled differently but I'm not sure how.
+            cls.client.delete_dataset_by_name(cls.default_test_dataset_id, delete_all_tables=True)
+        # TODO(Issue 6): This exception should probably be handled differently but I'm not sure how.
         except Exception as ex:
             log = logging.getLogger("BQTestCase")
             log.warning("Problem deleting dataset: " + str(ex) + ";"
-                        "Dataset contains tables: " + str(cls.client.tables(cls.dataset_name)))
-
-    @classmethod
-    def table_path(cls, table_name, dataset_name=None):
-        """Returns a path to a given table name within the dataset passed in,
-        or the temporary dataset if dataset_name is None.
-
-        Args:
-          table_name: The name of the table of interest.
-          dataset_name: The name of the dataset containing that table. If None,
-          then the class's dataset_name will be used.
-
-        Returns:
-          A string: '<temp dataset>.table_name'
-        """
-        if dataset_name:
-            return dataset_name + '.' + table_name
-
-        return cls.dataset_name + '.' + table_name
+                        "Dataset contains tables: " + str(cls.client.tables(
+                    cls.default_test_dataset_id)))
 
     @classmethod
     def create_mock_tables(cls):
         """Subclasses should override this to create up mock tables."""
 
         raise NotImplementedError("BQTestCase is an abstract class.")
+
+    @staticmethod
+    def make_n_digit_random_number(n):
+        if not isinstance(n, int) or n < 1 or n > 36:
+            raise ValueError('n must be an integer between 1 and 36.')
+        return str(uuid.uuid4().int)[:n]
 
     @staticmethod
     def create_synthetic_table_query(cols, rows):
@@ -201,9 +213,8 @@ class BQTestCase(unittest.TestCase):
             data.append(output_row)
         assert len(data) == len(row_data), \
             'Generated data should have as many rows as input'
-        table_path = cls.table_path(table_name)
-        cls.client.populate_table(table_path, table_schema, data, max_wait_sec=120)
-        cls.resources.add_or_update_bigquery_table(table_name, table_path)
+        table_path = cls.client.path(table_name)
+        cls.client.populate_table(table_path, table_schema, data, make_immediately_available=True)
 
     def _comment_helper(self, comments_list, idx):
         """Return the comment from the element in the list or '' if comment_list is empty"""
@@ -211,12 +222,26 @@ class BQTestCase(unittest.TestCase):
             return ''
         return comments_list[idx]
 
-    def expect_query_result(self, query, expected, comments=None):
+    def expect_table_contains(self, table_path, expected):
+        """
+        Checks whether the table at table_path contains exactly the rows in expected.
+
+        Args:
+            table_path: The table path to check
+            expected: The rows expected to be in table_path
+        """
+        query = SELECT_ALL_FORMAT.format(table_path)
+        self.expect_query_result(query, expected, enforce_ordering=False)
+
+    def expect_query_result(self, query, expected, enforce_ordering=True, comments=None):
         """Compiles the query, runs it and checks the results.
 
         Args:
           query: The query to execute.
           expected: A two dimensional array of query results to compare against.
+          enforce_ordering: If True, the rows must appear in the same order in the query results and
+              in the expected results. If False, then it will just check for count equality and then
+              for set equality between the two results.
           comments: list of comments, one per expected row.
         """
         if comments:
@@ -235,6 +260,11 @@ class BQTestCase(unittest.TestCase):
             len(expected), 'Expected {} rows of data, found {}.\n\n'
             'Expected:\n{}\n\nFound:\n{}'.format(
                 len(expected), len(results), _data_to_string(expected), _data_to_string(results)))
+
+        if not enforce_ordering:
+            self.assertSetEqual(set(results), set(expected))
+            return
+
         for i in range(len(results)):
             self.assertEqual(
                 len(results[i]),
@@ -288,7 +318,7 @@ class BQTestCase(unittest.TestCase):
                 else:
                     cast = str(col)
                 typecast_row.append(cast)
-            typecast_result.append(typecast_row)
+            typecast_result.append(tuple(typecast_row))
         return typecast_result
 
     @staticmethod
@@ -330,26 +360,25 @@ class BQTestCase(unittest.TestCase):
         return values
 
     @classmethod
-    def _create_test_table(cls, table_name, schema_file, data_file, table_postfix=''):
-        # type: (str, str, str, str) -> ()
+    def create_test_table(cls, table_name, schema_file, data_file=None, table_postfix=''):
+        # type: (str, str, Optional[str], str) -> ()
         """
         This method creates a table to be used in testing
 
         Args:
-            table_name: A string with the name of the table name to be added to resources
+            table_name: A string with the name of the table
             schema_file: A string with the name of the schema file from which to build the test
                 table
-            data_file: A string describing the file with the data to use in testing
+            data_file: A string describing the file with the data to use in testing. If None,
+                create an empty table.
             table_postfix: A string to be added to the end of the table_name.
         """
-        # TODO(PM-1238): Move this to BQTestCase
-        data = cls._load_csv_with_schema(schema_file, data_file)
-        table_path = cls.table_path(table_name + table_postfix)
+        data = cls._load_csv_with_schema(schema_file, data_file) if data_file else []
+        table_path = cls.client.path(table_name + table_postfix)
         with open(schema_file) as f:
             schema_json = json.load(f)
         schema_list = [SchemaField(row['name'], row['type']) for row in schema_json]
-        cls.client.populate_table(table_path, schema_list, data, max_wait_sec=60)
-        cls.resources.add_or_update_bigquery_table(table_name, table_path)
+        cls.client.populate_table(table_path, schema_list, data, make_immediately_available=True)
 
     @staticmethod
     def _get_fields_from_schema(schema_file):

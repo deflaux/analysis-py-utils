@@ -1,4 +1,4 @@
-# Copyright 2017 Verily Life Sciences Inc. All Rights Reserved.
+# Copyright 2019 Verily Life Sciences Inc. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,52 +16,44 @@
 Sample usage:
 
     client = bq.Client(project_id)
-    result = client.Query(query)
-
-NOTE: All API calls to BigQuery that call the REST API should be wrapped in execute_with_retries.
-This is because these calls are prone to failing randomly with 500 or 503 errors. You can see if
-something calls the REST API from the bq python client library:
-https://googlecloudplatform.github.io/google-cloud-python/stable/bigquery/usage.html
-In the documentation for each function, there should be a link to the REST API documentation if it
-is a REST API call.
+    result = client.get_query_results(query)
 """
 
-# This is a workaround to address
-# https://github.com/GoogleCloudPlatform/google-cloud-python/issues/2366
+# Workaround for https://github.com/GoogleCloudPlatform/google-cloud-python/issues/2366
 from __future__ import absolute_import
 
-from collections import OrderedDict
-import datetime
+import cStringIO
+import csv
 import json
 import logging
 import os
 import time
-from typing import List  # noqa: F401
-import uuid
+from collections import OrderedDict
 
+from google.api_core.future import polling
+from google.cloud.exceptions import BadRequest
+from typing import Any, Dict, List, Optional, Tuple, Union  # noqa: F401
+
+from google.api_core.exceptions import NotFound
 from google.cloud import bigquery, storage
+from google.cloud.bigquery.dataset import Dataset, DatasetReference
+from google.cloud.bigquery.job import ExtractJobConfig, LoadJobConfig, QueryJobConfig
+from google.cloud.bigquery import retry as bq_retry
+from google.cloud.bigquery.schema import SchemaField
+from google.cloud.bigquery.table import Table, TableReference
+from verily.bigquery_wrapper.bq_base import (MAX_TABLES, BigqueryBaseClient, BQ_PATH_DELIMITER,
+                                             validate_query_job)
 
-from verily.bigquery_wrapper.bq_base import (DEFAULT_MAX_API_CALL_TRIES, MAX_TABLES,
-                                             BigqueryBaseClient, execute_with_retries,
-                                             wait_for_job)
-
-
-class TimeoutException(Exception):
-    def __init__(self, message):
-        super(TimeoutException, self).__init__(message)
-
-
-# The call to datasets to list all tables requires you to set a maximum number of tables
-# (or use the unspecified API default). We always want to list all the tables so we set
-# a really high number for it. If ever there would be a dataset with more than 5000 tables,
-# this constant should be adjusted.
-MAX_TABLES = 5000
-
-# This is the default timeout for any Bigquery operations executed in this file.
-DEFAULT_TIMEOUT_SEC = 600
+# This is the default timeout for any BigQuery operations executed in this file, if no timeout is
+# specified in the constructor.
+DEFAULT_TIMEOUT_SEC = 1200
 
 # Bigquery has a limit of max 10000 rows to insert per request
 MAX_ROWS_TO_INSERT = 10000
+
+# When exporting data to multiple files, BQ pads the shard number to 12 digits. See:
+# https://cloud.google.com/bigquery/docs/exporting-data#exporting_data_into_one_or_more_files
+MULTIFILE_EXPORT_PAD_LENGTH = 12
 
 
 class Client(BigqueryBaseClient):
@@ -69,110 +61,152 @@ class Client(BigqueryBaseClient):
 
     Args:
       project_id: The id of the project to associate with the client.
+      default_dataset: Optional. The default dataset to use for operations if none is specified.
+      maximum_billing_tier: Optional. The maximum billing tier to use for operations.
+      max_wait_secs: Optional. The amount of time to keep retrying operations, or to wait on an
+          operation to finish. If not set, will default to DEFAULT_TIMEOUT_SEC
+      alternate_bq_client_class: Optional.  If provided, the client will use this class to create an
+          instance rather than the Google one.
     """
 
     def __init__(self, project_id, default_dataset=None, maximum_billing_tier=None,
-                 default_max_api_call_tries=DEFAULT_MAX_API_CALL_TRIES):
-        self.gclient = bigquery.Client(project=project_id)
-        self.default_max_api_call_tries = default_max_api_call_tries
+                 max_wait_secs=DEFAULT_TIMEOUT_SEC, alternate_bq_client_class=None):
+        self.gclient = (alternate_bq_client_class or bigquery.Client)(project=project_id)
+        self.max_wait_secs = max_wait_secs
+        # Retry object for errors encountered in making API calls (executing jobs, etc.)
+        self.default_retry_for_api_calls = bq_retry.DEFAULT_RETRY.with_deadline(max_wait_secs)
+        # Retry object for errors encountered while polling jobs in progress.
+        # See https://github.com/googleapis/google-cloud-python/issues/6301
+        self.default_retry_for_async_jobs = polling.DEFAULT_RETRY.with_deadline(max_wait_secs)
         super(Client, self).__init__(project_id, default_dataset, maximum_billing_tier)
 
-    def get_query_results(self, query, max_results=None, use_legacy_sql=False,
-                          max_wait_sec=DEFAULT_TIMEOUT_SEC):
-        """Returns a list or rows, each of which is a list of values.
+    def get_delimiter(self):
+        """ Returns the delimiter used to separate project, dataset, and table in a table path. """
+        return BQ_PATH_DELIMITER
 
-        Since we want to execute the query with retries, we need to surround the whole method with
-        a retry loop since we need a new query job with a new uuid each time.
+    @classmethod
+    def _wait_for_job(self, query_job, query, max_wait_secs=DEFAULT_TIMEOUT_SEC):
+        # type: (QueryJob, str, Optional[int]) -> Iterator[Row]
+        """Waits for a query job to finish and returns the result.
+
+        Surfaces any validation errors along with the offending query.
+
+        I have filed a feature request that printing the query be the default behavior.
+        https://github.com/GoogleCloudPlatform/google-cloud-python/issues/5408
+
+        Args:
+            query_job: The QueryJob to wait for.
+            query: The string query that the QueryJob is querying.
+            max_wait_secs: The maximum time to wait for the job to finish.
+
+        Returns:
+            The result of the query as an iterator of Row objects.
+        """
+        # Sleep for 1 second to make sure that the started job has had time to propagate validation
+        # errors.
+        time.sleep(1)
+        validate_query_job(query_job, query)
+        # Block until the job is done and return the result.
+        return query_job.result(timeout=max_wait_secs)
+
+    def get_query_results(self, query, use_legacy_sql=False, max_wait_secs=None):
+        # type: (str, Optional[bool], Optional[int]) -> List[Tuple[Any]]
+        """Returns a list or rows, each of which is a tuple of values.
 
         Args:
             query: A string with a complete SQL query.
-            max_results: Maximum number of rows to return. If None, return all rows
             use_legacy_sql: Whether to use legacy SQL
-            max_wait_sec: The maximum number of seconds to wait for the query to complete.
+            max_wait_secs: The maximum number of seconds to wait for the query to complete. If not
+                set, the class default will be used.
 
         Returns:
-            A list of lists of values.
+            A list of tuples of values.
         """
-        return execute_with_retries(
-            lambda: self._get_query_results_helper(
-                query, max_results=max_results, use_legacy_sql=use_legacy_sql,
-                max_wait_sec=DEFAULT_TIMEOUT_SEC),
-            self.default_max_api_call_tries)
-
-    def _get_query_results_helper(self, query, max_results, use_legacy_sql, max_wait_sec):
-        query_job = self.gclient.run_async_query(str(uuid.uuid4()), query)
-        query_job.use_legacy_sql = use_legacy_sql
+        config = QueryJobConfig()
         if self.maximum_billing_tier:
-            query_job.maximum_billing_tier = self.maximum_billing_tier
-        query_job.begin()
-        # This command is already wrapped in retries, so set max_tries to 1.
-        wait_for_job(query_job, query=query, max_wait_sec=max_wait_sec, max_tries=1)
-        query_results = bigquery.query.QueryResults('', self.gclient)
-        query_results._properties['jobReference'] = {
-            'jobId': query_job.name,
-            'projectId': query_job.project
-        }
+            config.maximum_billing_tier = self.maximum_billing_tier
 
-        # This command is already wrapped in retries, so set max_tries to 1.
-        return execute_with_retries(lambda: list(query_results.fetch_data(max_results=max_results)),
-                                    max_tries=1)
+        config.use_legacy_sql = use_legacy_sql
+
+        query_job = self.gclient.query(query, job_config=config,
+                                       retry=self.default_retry_for_api_calls)
+        # The above retry is for errors encountered in executing the jobs. The below retry is
+        # for errors encountered in polling to see whether the job is done.
+        query_job._retry = self.default_retry_for_async_jobs
+
+        rows = self._wait_for_job(query_job, query,
+                                  max_wait_secs=max_wait_secs or self.max_wait_secs)
+        if query_job.errors:
+            logging.warning('Errors in get_query_results: {}'.format(query_job.errors))
+        return [x.values() for x in list(rows)]
+
+    def get_table_reference_from_path(self, table_path):
+        # type: (str) -> TableReference
+        """
+        Returns a TableReference for a given path to a BigQuery table.
+
+        Args:
+            table_path: A BigQuery table path in the form project.dataset.table
+
+        Returns:
+            A TableReference for the table specified by the path
+        """
+        project, dataset, table = self.parse_table_path(table_path)
+        dataset_ref = DatasetReference(project, dataset)
+        return TableReference(dataset_ref, table)
 
     def create_table_from_query(self,
-                                query,
-                                table_path,
-                                write_disposition='WRITE_EMPTY',
-                                use_legacy_sql=False,
-                                max_wait_sec=DEFAULT_TIMEOUT_SEC,
-                                expected_schema=None):
+                                query,  # type: str
+                                table_path,  # type: str
+                                write_disposition='WRITE_EMPTY',  # type: Optional[str]
+                                use_legacy_sql=False,  # type: Optional[bool]
+                                max_wait_secs=None,  # type: Optional[int]
+                                expected_schema=None  # type: Optional[List[SchemaField]]
+                                ):
+        # type: (...) -> None
         """Creates a table in BigQuery from a specified query.
-
-        Since we want to execute the query with retries, we need to surround the whole method with
-        a retry loop since we need a new query job with a new uuid each time.
 
         Args:
           query: The query to run.
           table_path: The path to the table (in the client's project) to write
               the results to.
-          write_disposition: One of 'WRITE_TRUNCATE', 'WRITE_APPEND',
-              'WRITE_EMPTY'. Default is WRITE_EMPTY.
+          write_disposition: Specifies behavior if table already exists. See options here:
+              https://cloud.google.com/bigquery/docs/reference/rest/v2/jobs under
+              configuration.query.writeDisposition
           use_legacy_sql: Whether the query is written in standard or legacy sql.
-          max_wait_sec: Seconds to wait for the query before timing out. Set to None for async.
-          expected_schema: The expected schema of the resulting table (only required for mocking).
+          max_wait_secs: Seconds to wait for the query before timing out. If not
+                set, the class default will be used.
+          expected_schema: The expected schema of the resulting table; unused in this implementation
         """
-        return execute_with_retries(
-            lambda: self._create_table_from_query_helper(
-                query, table_path, write_disposition=write_disposition,
-                use_legacy_sql=use_legacy_sql, max_wait_sec=max_wait_sec,
-                expected_schema=expected_schema),
-            max_tries=self.default_max_api_call_tries)
-
-    def _create_table_from_query_helper(self,
-                                        query,
-                                        table_path,
-                                        write_disposition='WRITE_EMPTY',
-                                        use_legacy_sql=False,
-                                        max_wait_sec=DEFAULT_TIMEOUT_SEC,
-                                        expected_schema=None):  # pylint: disable=unused-argument
 
         if write_disposition not in ['WRITE_TRUNCATE', 'WRITE_APPEND', 'WRITE_EMPTY']:
             raise ValueError('write_disposition must be one of WRITE_TRUNCATE, '
                              'WRITE_APPEND, or WRITE_EMPTY')
-        _, dataset, table = self.parse_table_path(table_path)
-        query_job = self.gclient.run_async_query(str(uuid.uuid4()), query)
-        query_job.destination = self.gclient.dataset(dataset).table(table)
-        query_job.write_disposition = write_disposition
-        query_job.use_legacy_sql = use_legacy_sql
-        query_job.allow_large_results = True
-        if self.maximum_billing_tier:
-            query_job.maximum_billing_tier = self.maximum_billing_tier
-        query_job.begin()
-        if max_wait_sec:
-            # This command is already wrapped in retries, so set max_tries to 1.
-            wait_for_job(query_job, query=query, max_wait_sec=max_wait_sec, max_tries=1)
-        return query_job
 
-    def create_tables_from_dict(self, table_names_to_schemas, dataset_id=None,
-                                replace_existing_tables=True):
+        config = QueryJobConfig()
+        if self.maximum_billing_tier:
+            config.maximum_billing_tier = self.maximum_billing_tier
+        config.use_legacy_sql = use_legacy_sql
+        config.write_disposition = write_disposition
+        config.allow_large_results = True
+
+        config.destination = self.get_table_reference_from_path(table_path)
+
+        query_job = self.gclient.query(query, job_config=config,
+                                       retry=self.default_retry_for_api_calls)
+        # The above retry is for errors encountered in executing the jobs. The below retry is
+        # for errors encountered in polling to see whether the job is done.
+        query_job._retry = self.default_retry_for_async_jobs
+
+        return self._wait_for_job(query_job, query,
+                                  max_wait_secs=max_wait_secs or self.max_wait_secs)
+
+    def create_tables_from_dict(self,
+                                table_names_to_schemas,  # type: Dict[str, List[SchemaField]]
+                                dataset_id=None,  # type: Optional[str]
+                                replace_existing_tables=False,  # type: Optional[bool]
+                                ):
+        # type: (...) -> None
         """Creates a set of tables from a dictionary of table names to their schemas.
 
         Args:
@@ -180,22 +214,32 @@ class Client(BigqueryBaseClient):
             key: The table name.
             value: A list of SchemaField objects.
           dataset_id: The dataset in which to create tables. If not specified, use default dataset.
-          replace_existing_tables: If True, delete and re-create tables. Otherwise, leave
-            pre-existing tables alone and only create those that don't yet exist.
-        """
+          replace_existing_tables: If True, delete and re-create tables. Otherwise, checks to see
+              if any of the requested tables exist. If they do, it will raise a RuntimeError.
 
-        dataset_id = dataset_id if dataset_id else self.dataset
+        Raises:
+            RuntimeError if replace_existing_tables is False and any of the tables requested for
+                creation already exist
+        """
+        dataset_id = dataset_id or self.default_dataset_id
+        dataset_ref = DatasetReference(self.project_id, dataset_id)
+
+        # If the flag isn't set to replace existing tables, raise an error if any tables we're
+        # trying to create already exist.
+        if not replace_existing_tables:
+            self._raise_if_tables_exist(table_names_to_schemas.keys(), dataset_id)
+
         for name, schema in table_names_to_schemas.iteritems():
-            table = self.gclient.dataset(dataset_id).table(name, schema)
-            if self.table_exists(table):
-                if replace_existing_tables:
-                    self.delete_table(table)
-                else:
-                    logging.warning('Table {} already exists. Skipping.'.format(name))
-                    continue
+            table_ref = TableReference(dataset_ref, name)
+            # Use the Table object so it retains its schema.
+            table = bigquery.Table(table_ref, schema=schema)
+
+            if self.table_exists(table) and replace_existing_tables:
+                self.delete_table(table)
             self.create_table(table)
 
     def create_dataset_by_name(self, name, expiration_hours=None):
+        # type: (str, Optional[float]) -> None
         """Create a new dataset within the current project.
 
         Args:
@@ -203,100 +247,60 @@ class Client(BigqueryBaseClient):
           expiration_hours: The default expiration time for tables within the dataset.
         """
         if name not in self.get_datasets():
-            dataset = self.gclient.dataset(name)
+            # Initialize the Dataset instead of passing a reference so we can set expiration hours.
+            dataset = Dataset(DatasetReference(self.project_id, str(name)))
             if expiration_hours:
                 dataset.default_table_expiration_ms = expiration_hours * (60 * 60 * 1000)
             self.create_dataset(dataset)
+        else:
+            logging.warning('Dataset {} already exists.'.format(name))
 
-    def delete_dataset_by_name(self, name, delete_all_tables=False,
-                               max_wait_sec=DEFAULT_TIMEOUT_SEC):
+    def delete_dataset_by_name(self, name, delete_all_tables=False):
+        # type: (str, bool) -> None
         """Delete a dataset within the current project.
 
         Args:
           name: The name of the dataset to delete.
           delete_all_tables: If True, will delete all tables in the dataset before attempting to
               delete the dataset. You can't delete a dataset until it contains no tables.
-          max_wait_sec: The maximum amount of time to wait to delete the datasets.
+
+        Raises:
+            RuntimeError if there are still tables in the dataset and you try to delete it (with
+                delete_all_tables set to False)
         """
-        if delete_all_tables:
-            for table in list(self.tables(name)):
-                self.delete_table_by_name(table)
-        # Give BigQuery time to delete the tables before attempting to delete the dataset.
-        start_time = datetime.datetime.utcnow()
-        deadline = start_time + datetime.timedelta(seconds=max_wait_sec)
-        while datetime.datetime.utcnow() < deadline:
-            if len(self.tables(name)) == 0:
-                self.delete_dataset(self.gclient.dataset(name))
-                return
-            time.sleep(2)
-        raise RuntimeError("Couldn't delete dataset " + name + " .")
+        dataset_id = str(name)
+        dataset_ref = DatasetReference(self.project_id, dataset_id)
+
+        self.delete_dataset(dataset_ref, delete_all_tables)
 
     def delete_table_by_name(self, table_path):
-        """Delete a table within the current project.
+        # type: (str) -> None
+        """Delete a table.
 
         Args:
-          table_path: A string of the form '<dataset id>.<table name>'.
+          table_path: A string of the form '<dataset id>.<table name>' or
+              '<project id>.<dataset_id>.<table_name>'
         """
 
-        dataset_id, table_id = table_path.split('.')
-        self.delete_table(self.gclient.dataset(dataset_id).table(table_id))
+        self.delete_table(self.get_table_reference_from_path(table_path))
 
-    def tables(self, dataset_id, max_tries=None):
+    def tables(self, dataset_id):
+        # type: (str) -> List[str]
         """Returns a list of table names in a given dataset.
 
         Args:
-          dataset_id: The dataset to query.
-          max_tries: Optional number of times to try making the list_tables API call.
+          dataset_id: The name of the dataset to query.
 
         Returns:
           A list of table names (strings).
         """
-        dataset = self.gclient.dataset(dataset_id)
-        # Update the dataset so that it loads in all the tables. This syncs up the stored state
-        # of the dataset in this program to the actual state of the dataset in BigQuery.
-        start_time = datetime.datetime.utcnow()
-        deadline = start_time + datetime.timedelta(seconds=20)
-        dataset_updated = False
-        while not dataset_updated:
-            try:
-                self.reload_dataset(dataset)
-                dataset_updated = True
-            except Exception as ex:
-                if datetime.datetime.now() > deadline:
-                    raise ex
-                # Rate limit for metadata updates are one operation every two seconds, so
-                # we wait a couple seconds and try again.
-                time.sleep(2)
+        dataset_ref = DatasetReference(self.project_id, dataset_id)
 
-        max_tries = max_tries or self.default_max_api_call_tries
-        tables = execute_with_retries(lambda: list(dataset.list_tables(max_results=MAX_TABLES)),
-                                      max_tries)
-        # Each entry in the list returned by list_tables() is of the form
-        # <project>:<dataset>.<table> so this converts them to <dataset>.<table>
-        # This is used by the test fixture tear down, so if a change causes this
-        # to start failing, unit tests will break.
-        return [t.table_id.split(':')[1] for t in tables]
-
-    def _get_bq_table(self, table_name, dataset_id=None, project_id=None):
-        """Get a bigquery.table object for the given table name/path
-        Args:
-            table_name: Name of the table
-            dataset_id: Dataset ID
-            project_id: Project ID
-        Returns:
-            A bigquery.table object
-        """
-        if not dataset_id:
-            if not self.dataset:
-                raise ValueError("Neither dataset_id or the default dataset id is specified")
-            dataset_id = self.dataset
-
-        if not project_id or project_id == self.project_id:
-            return self.gclient.dataset(dataset_id).table(table_name)
-
-        return bigquery.Client(project_id).dataset(dataset_id).table(table_name)
+        tables = self.gclient.list_tables(dataset_ref, retry=self.default_retry_for_api_calls)
+        return [t.table_id for t in tables]
 
     def get_schema(self, dataset_id, table_name, project_id=None):
+        # type: (str, str, Optional[str]) -> List[SchemaField]
         """Returns the schema of a table.
 
         Args:
@@ -307,132 +311,195 @@ class Client(BigqueryBaseClient):
           A list of SchemaFields representing the schema.
         """
 
-        table = self._get_bq_table(table_name, dataset_id, project_id)
+        dataset_ref = DatasetReference(project_id if project_id else self.project_id, dataset_id)
+        table = self.gclient.get_table(TableReference(dataset_ref, table_name),
+                                       retry=self.default_retry_for_api_calls)
 
-        # Note: The reload() method below does not return the data in the table, it only returns the
-        # table resource, which describes the structure of this table.
-        self.reload_table(table)
         return table.schema
 
-    def get_datasets(self, max_tries=None):
-        """Returns a list of dataset ids in the current project.
+    def get_datasets(self):
+        # type: (None) -> List[str]
+        """Returns a list of dataset ids in the default project.
 
-        Args:
-            max_tries: Optional number of retries for list_datasets API call.
         Returns:
             A list of dataset ids/names (strings).
         """
-        max_tries = max_tries or self.default_max_api_call_tries
-        datasets = execute_with_retries(
-            lambda: list(self.gclient.list_datasets(max_results=MAX_TABLES)), max_tries)
+        return [x.dataset_id for x in self.gclient.list_datasets(
+            max_results=MAX_TABLES, retry=self.default_retry_for_api_calls)]
 
-        # Each entry in the list returned by list_datasets() is of the form
-        # <project>:<dataset> so this removes the project id.
-        # This is used by the test fixture setup, so if a change causes this
-        # to start failing, unit tests will break.
-        return [ds.name for ds in datasets]
-
-    def populate_table(self, table_path, schema, data=[], max_wait_sec=DEFAULT_TIMEOUT_SEC,
-                       max_tries=1):
-        """Creates a table and populates it with a list of rows.
-
-        The data is written using the BQ streaming API, which does not immediately make the data
-        available for pulling the table. However, it is immediately available for querying, and a
-        table created from a query is immediately available for pulling. So, we stream the data
-        into a temporary table, then query the temp table to create the requested table.
-
-        If max_wait_sec is reached and there's still no data in the temporary table, attempt to
-        insert data again up to max_tries times.
+    @staticmethod
+    def _convert_row_tuples_to_dicts(data, schema):
+        # type: (List[Tuple[str]], List[SchemaField]) -> List[Dict[str, Any]]
+        """
+        Converts data (in combination with the passed-in schema) into JSON for inserting.
 
         Args:
-            table_path: A string of the form '<dataset id>.<table name>'.
-            schema: A list of SchemaFields to represent the table's schema.
-            data: A list of rows, each of which is a list of values.
-            max_wait_sec: The maximum number of seconds to wait for the table to be populated.
-            max_tries: The maximum number of tries each time max_wait_sec is reached.
+            data: A list of tuples, where each tuple represents a row of data. Each tuple should be
+                the same length as 'schema', and should list its columns in the same order 'schema'
+                does.
+            schema: A list of SchemaFields representing the schema of the rows passed in as data.
+
+        Returns:
+            A list of dictionaries, where each dictionary is a representation of a table row.
+
+        Raises:
+            RuntimeError if the length of any row is different than the length of the schema
         """
-        tmp_path = table_path + "_tmp"
-        _, dataset_id, tmp_table_id = self.parse_table_path(tmp_path)
+        dict_rows = []
+        for row in data:
+            if len(row) != len(schema):
+                raise RuntimeError('The row {} has the wrong number of values for the schema {}.'
+                                   .format(str(row), str(schema)))
 
-        tmp_table = self.gclient.dataset(dataset_id).table(tmp_table_id, schema)
-        self.delete_and_recreate_table(tmp_table)
-        select_all_from_tmp_table_query = 'SELECT * FROM `' + tmp_path + '`'
+            row_dict = {schema[i].name: val for i, val in enumerate(row)}
+            dict_rows.append(row_dict)
+
+        return dict_rows
+
+    def _stream_chunks_of_rows(self, table, data, table_schema):
+        # type: (Table, List[Tuple[Any]], List[SchemaField]) -> None
+        """
+        Does a streaming insert of data into the table (given the table_schema). Note that streaming
+        inserts are immediately available for querying, but not for exporting or copying.
+        https://cloud.google.com/bigquery/streaming-data-into-bigquery
+
+        This function chunks the data into portions below the import rate limit and inserts them
+        chunk by chunk.
+
+        Args:
+            table: Name of the table to insert into
+            data: List of tuples, where each tuple represents a row of data to insert
+            table_schema: List of SchemaFields representing the schema of the table
+
+        Raises:
+            RuntimeError upon any insertion errors
+        """
+        error_list = []
+        start = 0
+        num_rows = len(data)
+
+        # BigQuery has a limit of max 10k to insert per request
+        while start < num_rows:
+            end = start + MAX_ROWS_TO_INSERT
+            # Convert the rows into dictionaries so we can insert with schema checking.
+            error_list.extend(self.gclient
+                              .insert_rows(table,
+                                           self._convert_row_tuples_to_dicts(data[start:end],
+                                                                             table_schema),
+                                           retry=self.default_retry_for_api_calls))
+            start = end
+
+        if error_list:
+            raise RuntimeError('Could not insert rows. Reported errors:\n' +
+                               self._make_errors_readable(error_list))
+
+    def populate_table(self, table_path, schema, data=[], make_immediately_available=True,
+                       replace_existing_table=False):
+        # type: (str, List[SchemaField], Optional[List[Any]], Optional[bool], Optional[bool]) -> None
+        """Creates a table and populates it with a list of rows.
+
+        If make_immediately_available is False, the table will be created using streaming inserts.
+        Note that streaming inserts are immediately available for querying, but not for exporting or
+        copying, so if you need that capability you should set make_immediately_available to True.
+        https://cloud.google.com/bigquery/streaming-data-into-bigquery
+
+        If the table is already created, it will raise a RuntimeError, unless replace_existing_table
+        is True.
+
+        Args:
+          table_path: A string of the form '<dataset id>.<table name>'
+              or '<project id>.<dataset id>.<table name>'.
+          schema: A list of SchemaFields to represent the table's schema.
+          data: A list of rows, each of which corresponds to a row to insert into the table.
+          make_immediately_available: If False, the table won't immediately be available for
+              copying or exporting, but will be available for querying. If True, after this
+              operation returns, it will be available for copying and exporting too.
+          replace_existing_table: If set to True, the table at table_path will be deleted and
+              recreated if it's already present.
+
+        Raises:
+            RuntimeError if the table at table_path is already there and replace_existing_table
+                is False
+        """
+        # Use the Table object so we can pass through the schema.
+        table = Table(self.get_table_reference_from_path(table_path), schema)
+        if self.table_exists(table):
+            if replace_existing_table:
+                self.delete_table(table)
+            else:
+                raise RuntimeError('The table {} already exists.'.format(table_path))
+        self.create_table(table)
+
         if data:
-            # The BigQuery streaming API does not guarantee the data will be queryable immediately,
-            # so we need to wait for data to show up in the temporary table before creating another
-            # table from it.
-            # The retry and timout logic fixes flaky test failures.
-            num_tries = 0
-            success = False
-            while num_tries < max_tries:
-                # We don't pass through a schema because we trust the table to be created correctly.
-                self.append_rows(tmp_path, data)
+            if make_immediately_available:
+                output = cStringIO.StringIO()
 
-                deadline = datetime.datetime.utcnow() + datetime.timedelta(seconds=max_wait_sec)
-                while True:
-                    if self.get_query_results(select_all_from_tmp_table_query):
-                        success = True
-                        break
-                    elif datetime.datetime.utcnow() > deadline:
-                        num_tries += 1
-                        logging.warning(
-                            'Could not populate table, retrying. Attempt {} of {}.'.format(
-                                num_tries, max_tries))
-                        break
-                    time.sleep(1)
-                if success:
-                    break
-            if not success:
-                raise RuntimeError('Max number of retries reached.')
+                csv_out = csv.writer(output)
+                for row in data:
+                    csv_out.writerow(row)
 
-        self.create_table_from_query(select_all_from_tmp_table_query, table_path)
-        # Delete the temporary table after the data is inserted.
-        self.delete_table(tmp_table)
+                job_config = LoadJobConfig()
+                job_config.source_format = 'text/csv'
+                # By default this does six retries. It does not accept any other timeout or
+                # retry parameters.
+                job = self.gclient.load_table_from_file(output, table.reference,
+                                                        job_config=job_config,
+                                                        rewind=True)
+                try:
+                    job.result()
+                except BadRequest as e:
+                    raise BadRequest('{} Error stream: {}'.format(str(e), job.error_result))
+                job.result()
 
-    def append_rows(self, table_path, data, columns=None, max_tries=None):
-        """Appends the rows contained in data to the table at table_path.
+                output.close()
+            else:
+                self._stream_chunks_of_rows(table, data, schema)
+
+    def append_rows(self, table_path, data, schema=None):
+        # type: (str, List[Tuple[Any]], Optional[List[SchemaField]]) -> None
+        """Appends the rows contained in data to the table at table_path using streaming inserts.
+        Note that streaming inserts are immediately available for querying, but not for exporting or
+        copying. https://cloud.google.com/bigquery/streaming-data-into-bigquery
 
         Args:
           table_path: A string of the form '<dataset id>.<table name>'.
           data: A list of rows, each of which is a list of values.
-          columns: Optionally, a list of pairs (<column name>, <value type>) to describe the
+          schema: Optionally, a list of pairs (<column name>, <value type>) to describe the
               table's expected schema. If this is present, it will check the table's schema against
               the provided schema.
-          max_tries: Optional number of tries for insert_data API call.
 
         Raises:
             RuntimeError: if the schema passed in as columns doesn't match the schema of the
                 already-created table represented by table_path, or if the table doesn't exist,
                 or if there are errors inserting the rows.
         """
-        _, dataset_id, table_id = self.parse_table_path(table_path)
-        table = self.gclient.dataset(dataset_id).table(table_id)
-        self.reload_table(table)
-        table_schema = [(x.name, x.field_type)
-                        for x in self.get_schema(dataset_id, table_id, self.project_id)]
+
+        table = self.gclient.get_table(self.get_table_reference_from_path(table_path),
+                                       retry=self.default_retry_for_api_calls)
 
         if not self.table_exists(table):
-            raise RuntimeError("The table " + table_id + " doesn't exist.")
-        if columns is not None and table_schema != columns:
-            raise RuntimeError("The incoming schema doesn't match the existing table's schema.")
+            raise RuntimeError("The table " + table_path + " doesn't exist.")
 
-        error_list = []
-        start = 0
-        num_rows = len(data)
-        # Bigquery has a limit of max 10k to insert per request
-        while start < num_rows:
-            end = start + MAX_ROWS_TO_INSERT
-            max_tries = max_tries or self.default_max_api_call_tries
-            error_list.extend(execute_with_retries(lambda: table.insert_data(data[start:end]),
-                                                   max_tries))
-            start = end
+        if schema is not None:
+            schema_diffs = BigqueryBaseClient.list_schema_differences(table.schema, schema)
+            if schema_diffs:
+                raise RuntimeError("The incoming schema doesn't match "
+                                   "the existing table's schema: {}"
+                                   .format('\n'.join(schema_diffs)))
 
-        # If there are errors in the insert, the table will never be modified, so we want to surface
-        # those errors. The returned value from table.insert_data is a list of dictionaries, where
-        # the dictionary values contain a list of dictionaries with the actual errors so it's
-        # complicated to get results in a readable format.
+        self._stream_chunks_of_rows(table, data, table.schema)
+
+    @staticmethod
+    def _make_errors_readable(error_list):
+        # type: (List[Dict[str, str]]) -> str
+        """
+        The returned value from table.insert_data is a list of dictionaries, where
+        the dictionary values contain a list of dictionaries with the actual errors so it's
+        complicated to get results in a readable format. This functions parses that output into a
+        nice string.
+        """
+        row_errors = []
         if error_list:
-            row_errors = []
             for error_entry in error_list:
                 # The index entry of each dictionary contains the row number.
                 line_number = error_entry['index']
@@ -445,107 +512,183 @@ class Client(BigqueryBaseClient):
                                                          err_dict['location']))
                 row_errors.append('Line {}:\n {}'.format(line_number,
                                                          '\n\t'.join(formatted_errors_list)))
+        return '\n'.join(row_errors)
 
-            raise RuntimeError('Could not insert rows. Reported errors:\n' + '\n'.join(row_errors))
+    def copy_table(self, source_table_path,  # type: str
+                   destination_table_name,  # type: str
+                   destination_dataset=None,  # type: Optional[str]
+                   destination_project=None,  # type: Optional[str]
+                   replace_existing_table=False  # type: bool
+                   ):
+        # type: (...) -> None
+        """
+        Copies the table at source_table_path to the location
+        destination_project.destination_dataset.destination_table_name. If the destination project
+        or dataset aren't set, the class default will be used.
 
-    def _compare_schemas(self, schema_a, schema_b):
-        if len(schema_a) != len(schema_b):
-            raise RuntimeError('Schema {} is not the same length as schema {}.'
-                               .format(str(schema_a), str(schema_b)))
+        Args:
+            source_table_path: The path of the table to copy.
+            destination_table_name: The name of the table to copy to.
+            destination_dataset: The name of the destination dataset. If unset, the client default
+                dataset will be used.
+            destination_project: The name of the destination project. If unset, the client default
+                project will be used.
+            replace_existing_table: If True, if the destination table already exists, it will delete
+                it and copy the source table in its place.
 
-        for i in range(len(schema_a)):
-            if schema_a[0] != schema_b[0]:
-                raise RuntimeError('Column index {} is named {} in the first schema, but {} in the'
-                                   'second schema.'.format(i, schema_a[0], schema_b[0]))
-            a_datatype = schema_a[1]
-            b_datatype = schema_b[1]
-            if a_datatype != b_datatype:
-                for dt_class in self.DATATYPE_CLASSES:
-                    if a_datatype in dt_class and b_datatype not in dt_class:
-                        raise RuntimeError("For column {}, {} is not the same type as {}."
-                                           .format(schema_a[0], a_datatype, b_datatype))
+        Raises:
+            RuntimeError if the destination table already exists and replace_existing_table is False
+            or the destination dataset does not exist
+        """
+
+        destination_dataset = destination_dataset or self.default_dataset_id
+        destination_project = destination_project or self.project_id
+
+        dataset_ref = DatasetReference(destination_project, destination_dataset)
+
+        if not self.dataset_exists(dataset_ref):
+            raise RuntimeError('The dataset {} does not exist in project {}.'
+                               .format(destination_dataset, destination_project))
+
+        dest_table_ref = TableReference(dataset_ref, destination_table_name)
+
+        if self.table_exists(dest_table_ref):
+            if replace_existing_table:
+                self.delete_table(dest_table_ref)
+            else:
+                raise RuntimeError('The table {} already exists in dataset {}.'
+                                   .format(destination_table_name, destination_dataset))
+
+        dest_table_path = self.path(destination_table_name,
+                                    destination_dataset,
+                                    destination_project)
+
+        self.create_table_from_query('SELECT * FROM `{}`'.format(source_table_path),
+                                     dest_table_path)
 
     def export_table_to_bucket(self,
-                               table_path,
-                               bucket_name,
-                               dir_in_bucket='',
-                               output_format='csv',
-                               compression=False,
-                               output_ext='',
-                               max_wait_sec=DEFAULT_TIMEOUT_SEC):
-        """Export a bigquery table to a file in the given bucket. The output file has the same name
-           as the table.
+                               table_path,  # type: str
+                               bucket_name,  # type: str
+                               dir_in_bucket='',  # type: Optional[str]
+                               output_format='csv',  # type: Optional[str]]
+                               compression=False,  # type: Optional[bool]
+                               output_ext='',  # type: Optional[str]
+                               max_wait_secs=None,  # type: Optional[int]
+                               support_multifile_export=True, # type: bool
+                               explicit_filename=None  # type: Optional[str]
+                               ):
+        # type: (...) -> List[str]
+        """
+        Export a BigQuery table to a file (or a set of files)
+        in the given bucket. The output files will be in a directory with the same name
+        as the table, within the bucket_name and dir_in_bucket provided.
+
         Args:
             table_path: Path of the table
             bucket_name: Name of the bucket to store the spreadsheet
             dir_in_bucket: The directory in the bucket to store the output files
             output_format: Format of output. It must be among 'csv', 'json' and 'avro'
             compression: Whether to use GZIP compression. Avro cannot be used with GZIP compression
-            output_ext: An optional extention to output file. So that we can tell output files from
-                        different exports
-            max_wait_sec: Maximum time to wait. Export table to storage takes significantly longer
-                          than query a table
-        """
-        # A mapping table from supported formats to bigquery required formats.
-        bigquery_required_formats = {'csv': 'CSV', 'json': 'NEWLINE_DELIMITED_JSON', 'avro': 'AVRO'}
+            output_ext: An optional extension to output file. So that we can tell output files from
+                different exports
+            max_wait_secs: Maximum time to wait. Export table to storage takes significantly longer
+                than query a table. If not set, it will use the class default.
+            support_multifile_export: If True, and the table is large enough, then the table will be
+                exported as several files suffixed with a shard number. If False, it will be exported
+                as a single file.
+            explicit_filename: File name. Use it as file name if specified, otherwise use table ID,
+                maybe with output_ext, as file name
 
-        if output_format not in bigquery_required_formats:
-            raise ValueError('Invalid output format: {}. Must be among {}'.format(
-                output_format, bigquery_required_formats.keys()))
+        Returns:
+            A list of the names of the files exported.
+
+        Raises:
+            RuntimeError if there is a problem with the export job.
+        """
+        bq_output_format = self._convert_to_bq_format(output_format)
 
         if compression and output_format == 'avro':
             raise ValueError('{} cannot be combined with GZIP compression'.format(output_format))
 
-        project_id, dataset_id, table_name = self.parse_table_path(table_path)
+        src_table_ref = self.get_table_reference_from_path(table_path)
 
-        src_table = self._get_bq_table(table_name, dataset_id, project_id)
+        # Generate the destination of the table content.
+        if explicit_filename:
+            output_filename = explicit_filename
+        else:
+            output_filename = src_table_ref.table_id
+            if output_ext:
+                output_filename += '_' + output_ext
 
-        # Generate the destination of the table content
-        output_filename = table_name
-        if output_ext:
-            output_filename += '_' + output_ext
+        if support_multifile_export:
+            # End in a * so that multiple shards can be written out if needed.
+            output_filename += '-*'
         output_filename += '.' + output_format
         if compression:
             output_filename += '.gz'
+
         path = os.path.join(dir_in_bucket, output_filename)
 
         destination = 'gs://{}/{}'.format(bucket_name, path.lstrip().lstrip('/'))
 
-        # Export table content into a file in the bucket
-        execute_with_retries(
-            lambda: self._run_export_table_to_bucket_job(
-                bigquery_required_formats, compression, destination, max_wait_sec, output_format,
-                src_table), max_tries=self.default_max_api_call_tries)
+        config = ExtractJobConfig()
+        config.destination_format = bq_output_format
+        config.compression = 'GZIP' if compression else 'NONE'
 
-    def _run_export_table_to_bucket_job(self, bigquery_required_formats, compression, destination,
-                                        max_wait_sec, output_format, src_table):
-        job_name = str(uuid.uuid4())
-        job = self.gclient.extract_table_to_storage(job_name, src_table, destination)
-        job.destination_format = bigquery_required_formats[output_format]
-        job.compression = 'GZIP' if compression else 'NONE'
+        extract_job = self.gclient.extract_table(src_table_ref, destination, job_config=config,
+                                                 retry=self.default_retry_for_api_calls)
 
-        job.begin()
-        # This command is already wrapped in retries, so set max_tries to 1.
-        wait_for_job(job, max_wait_sec=max_wait_sec, max_tries=1)
+        # Wait for completion
+        extract_job.result(timeout=max_wait_secs or self.max_wait_secs)
 
-    def export_schema_to_bucket(self, table_path, bucket_name, dir_in_bucket='', output_ext=''):
-        """Export a bigquery table's schema to a json file in the given bucket. The output file's
+        # Get the names of the files exported.
+        if support_multifile_export:
+            # destination_uri_file_counts is a list of ints representing the number of files
+            # exported to each destination URI. Since we are only exporting to one destination, we
+            # just need the first element.
+            num_files_exported = extract_job.destination_uri_file_counts[0]
+            # Multi-file export replaces the "*" with the file number, padded to 12 digits. See:
+            # https://cloud.google.com/bigquery/docs/exporting-data#exporting_data_into_one_or_more_files  # noqa
+            return [output_filename.replace('*', str(i).zfill(MULTIFILE_EXPORT_PAD_LENGTH))
+                    for i in range(num_files_exported)]
+        return [output_filename]
+
+    def export_schema_to_bucket(self,
+                                table_path,  # type: str
+                                bucket_name,  # type: str
+                                dir_in_bucket='',  # type: Optional[str]
+                                output_ext='',  # type: Optional[str]
+                                explicit_filename=None,  # type: Optional[str]
+                                ):
+        # type: (...) -> str
+        """
+        Export a BigQuery table's schema to a json file in the given bucket. The output file's
         name is <BQ table name>-schema.json
+
         Args:
             table_path: Path of the table
             bucket_name: Name of the bucket to store the spreadsheet. The bucket must be in project
-                         self.project_id
+                self.project_id
             dir_in_bucket: The directory in the bucket to store the output files
-            output_ext: An optional extention to output file. So that we can tell output files from
-                        different exports
+            output_ext: An optional extension to output file. So that we can tell output files from
+                different exports
+            explicit_filename: File name. Use it as file name if specified, otherwise use table ID,
+                maybe with output_ext, as file name
+
+        Returns:
+            The name of the schema file exported.
         """
         table_project, dataset_id, table_name = self.parse_table_path(table_path)
 
         # Generate the destination of the table schema
-        schema_filename = table_name
-        if output_ext:
-            schema_filename += '_' + output_ext
+        if explicit_filename:
+            schema_filename = explicit_filename
+        else:
+            schema_filename = table_name
+            if output_ext:
+                schema_filename += '_' + output_ext
         schema_filename += '-schema.json'
+
         schema_path = os.path.join(dir_in_bucket, schema_filename).lstrip().lstrip('/')
 
         # Export schema as a json file to the bucket
@@ -558,119 +701,235 @@ class Client(BigqueryBaseClient):
                                         storage.Client(self.project_id).bucket(bucket_name))
 
         schema_blob.upload_from_string(json.dumps(schema, indent=2, separators=(',', ':')))
+        return schema_filename
 
-    def delete_and_recreate_table(self, table):
-        if self.table_exists(table):
-            self.delete_table(table)
-        self.create_table(table)
-        self.reload_table(table)
+    @staticmethod
+    def _convert_to_bq_format(format):
+        """
+        Converts one of the internally expressed formats (csv, avro, or json) into the
+        corresponding BigQuery constant. See
+        https://cloud.google.com/bigquery/docs/reference/rest/v2/jobs#configuration.load.sourceFormat
+        """
+        # A mapping table from supported formats to bigquery required formats.
+        bigquery_required_formats = {'csv': 'CSV', 'json': 'NEWLINE_DELIMITED_JSON', 'avro': 'AVRO'}
+        if format not in bigquery_required_formats:
+            raise ValueError('Invalid input format: {}. Must be among {}'.format(
+                format, bigquery_required_formats.keys()))
+        return bigquery_required_formats[format]
 
-    def dataset_exists(self, dataset, max_tries=None):
-        # type: (dataset) -> bool
+    @staticmethod
+    def _make_load_job_config(source_format,  # type: str
+                              write_disposition,  # type: str
+                              schema=None,  # type: Optional[List[SchemaField]]
+                              skip_leading_row=False,  #type: bool
+                              ):
+        """
+        Makes and returns a LoadJobConfig according to the passed-in parameters.
+        Args:
+            source_format: Should be a recognized BigQuery source format. See
+                https://cloud.google.com/bigquery/docs/reference/rest/v2/jobs#configuration.load.sourceFormat
+            write_disposition: Should be a recognized BigQuery write disposition. See
+                https://cloud.google.com/bigquery/docs/reference/rest/v2/jobs#configuration.load.writeDisposition
+            schema: A list of SchemaFields. If unset, BigQuery will try to infer a schema.
+            skip_leading_row: If True, the first row of the file loaded in will be skipped.
+        """
+        job_config = LoadJobConfig()
+        job_config.source_format = source_format
+        job_config.write_disposition = write_disposition
+        if schema:
+            job_config.schema = schema
+        else:
+            job_config.autodetect = True
+        if skip_leading_row:
+            job_config.skip_leading_rows = 1
+        return job_config
+
+    def import_table_from_bucket(self,
+                                 table_path,  # type: str
+                                 source_uri,  # type: str
+                                 schema=None, # type: List[SchemaField]
+                                 input_format='csv',  # type: Optional[str]]
+                                 write_disposition='WRITE_APPEND',  # type: str
+                                 skip_leading_row=False, # type: bool
+                                 max_wait_secs=None  # type: Optional[int]
+                                ):
+        # type: (...) -> None
+        """
+        Imports data from a file in a bucket to a BigQuery table.
+
+        Args:
+            table_path:  The path to the table that the data should be loaded in. If the table
+                doesn't already exist, it will be created.
+            source_uri: The URI for the file in the bucket to load.
+            schema: The BigQuery schema for the data. If not provided, BigQuery will try to infer.
+            input_format: The format of the input file. Can be 'csv', 'avro', or 'json'.
+            write_disposition: The write disposition to use, see writeDisposition on this page:
+                https://cloud.google.com/bigquery/docs/reference/rest/v2/jobs
+            skip_leading_row: If True, it will skip the first row of data in the
+                file (presumably a header)
+            max_wait_secs: The amount of time to wait for the table to import. This operation can
+                be slower than other operations in this class. If unset, it will use the
+                class default timeout.
+
+        Raises:
+            RuntimeError if there is a problem executing the load job.
+        """
+        input_format = self._convert_to_bq_format(input_format)
+
+        table_ref = self.get_table_reference_from_path(table_path)
+        job_config = self._make_load_job_config(input_format, write_disposition,
+                                                schema, skip_leading_row)
+        load_job = self.gclient.load_table_from_uri(source_uri, table_ref,
+                                                    retry=self.default_retry_for_api_calls,
+                                                    job_config=job_config)
+        load_job.result(max_wait_secs or self.max_wait_secs)
+
+    def import_table_from_file(self,
+                               table_path,  # type: str
+                               opened_source_file,  # type: File
+                               schema,  # type: List[SchemaField]
+                               input_format='csv',  # type: Optional[str]]
+                               write_disposition='WRITE_APPEND',
+                               skip_leading_row=False,  # type: bool
+                               max_wait_secs=None  # type: Optional[int]
+                              ):
+        # type: (...) -> None
+        """
+        Imports data from a local file to a BigQuery table.
+
+        Args:
+            table_path:  The path to the table that the data should be loaded in. If the table
+                doesn't already exist, it will be created.
+            opened_source_file: The source file, already opened in read-binary mode.
+            schema: The BigQuery schema for the data. If unset, BigQuery will try to infer.
+            input_format: The format of the input file. Can be 'csv', 'avro', or 'json'.
+            write_disposition: The write disposition to use, see writeDisposition on this page:
+                https://cloud.google.com/bigquery/docs/reference/rest/v2/jobs
+            skip_leading_row: If True, it will skip the first row of data in the
+                file (presumably a header)
+            max_wait_secs: The amount of time to wait for the table to import. This operation can
+                be slower than other operations in this class. If unset, it will use the
+                class default timeout.
+
+        Raises:
+            RuntimeError if there is a problem executing the load job.
+        """
+        input_format = self._convert_to_bq_format(input_format)
+
+        # Load it into Bigquery
+        table_ref = self.get_table_reference_from_path(table_path)
+        job_config = self._make_load_job_config(input_format, write_disposition,
+                                                schema, skip_leading_row)
+        load_job = self.gclient.load_table_from_file(opened_source_file, table_ref,
+                                                     job_config=job_config)
+        load_job.result(max_wait_secs or self.max_wait_secs)
+
+    def dataset_exists(self,
+                       dataset  # type: Union[Dataset, DatasetReference]
+                       ):
+        # type: (...) -> bool
         """Checks if a dataset exists.
 
         Args:
             dataset: The BQ dataset object to check.
-            max_tries: The maximum number of times to try calling the API before giving up. Defaults
-                to self.default_max_api_call_tries.
         """
-        max_tries = max_tries or self.default_max_api_call_tries
-        return execute_with_retries(lambda: dataset.exists(), max_tries)
+        if isinstance(dataset, Dataset):
+            dataset = dataset.reference
 
-    def table_exists(self, table, max_tries=None):
-        # type: (table) -> bool
+        try:
+            self.gclient.get_dataset(dataset, retry=self.default_retry_for_api_calls)
+            return True
+        except NotFound:
+            return False
+
+    def table_exists(self,
+                     table  # type: Union[TableReference, Table]
+                     ):
+        # type: (...) -> bool
         """Checks if a table exists.
 
         Args:
-            table: The BQ table object to check.
-            max_tries: The maximum number of times to try calling the API before giving up. Defaults
-                to self.default_max_api_call_tries.
+            table: The TableReference or Table for the table to check whether it exists.
         """
-        max_tries = max_tries or self.default_max_api_call_tries
-        return execute_with_retries(lambda: table.exists(), max_tries)
 
-    def delete_dataset(self, dataset, max_tries=None):
-        # type: (dataset) -> None
+        if isinstance(table, Table):
+            table = table.reference
+
+        try:
+            self.gclient.get_table(table, retry=self.default_retry_for_api_calls)
+            return True
+        except NotFound:
+            return False
+
+    def delete_dataset(self,
+                       dataset,  # type: Union[Dataset, DatasetReference]
+                       delete_contents=False  # type: bool
+                       ):
+        # type: (...) -> None
         """Deletes a dataset.
 
         Args:
-            dataset: The BQ dataset object to delete.
-            max_tries: The maximum number of times to try calling the API before giving up. Defaults
-                to self.default_max_api_call_tries.
+            dataset: The Dataset or DatasetReference to delete.
+            delete_contents: If True, delete all tables in the dataset before deleting it.
         """
-        max_tries = max_tries or self.default_max_api_call_tries
-        return execute_with_retries(lambda: dataset.delete(), max_tries)
+        self.gclient.delete_dataset(dataset, retry=self.default_retry_for_api_calls,
+                                    delete_contents=delete_contents)
 
-    def delete_table(self, table, max_tries=None):
-        # type: (table) -> None
+    def delete_table(self,
+                     table  # type: Union[Table, TableReference]
+                     ):
+        # type: (...) -> None
         """Deletes a table.
 
         Args:
-            table: The BQ table object to delete.
-            max_tries: The maximum number of times to try calling the API before giving up. Defaults
-                to self.default_max_api_call_tries.
+            table: The Table or TableReference to delete.
         """
-        max_tries = max_tries or self.default_max_api_call_tries
-        return execute_with_retries(lambda: table.delete(), max_tries)
+        self.gclient.delete_table(table, retry=self.default_retry_for_api_calls)
 
-    def create_dataset(self, dataset, max_tries=None):
-        # type: (dataset) -> None
-        """Creates a dataset.
+    def create_dataset(self,
+                       dataset  # type: Union[DatasetReference, Dataset]
+                       ):
+        # type: (...) -> None
+        """
+        Creates a dataset.
 
         Args:
-            dataset: The BQ dataset object to create.
-            max_tries: The maximum number of times to try calling the API before giving up. Defaults
-                to self.default_max_api_call_tries.
+            dataset: The Dataset object to create.
         """
-        max_tries = max_tries or self.default_max_api_call_tries
-        return execute_with_retries(lambda: dataset.create(), max_tries)
+        if isinstance(dataset, DatasetReference):
+            dataset = Dataset(dataset)
 
-    def create_table(self, table, max_tries=None):
-        # type: (table) -> None
-        """Creates a table.
+        self.gclient.create_dataset(dataset)
+
+    def create_table(self,
+                     table  # type: Union[Table, TableReference]
+                     ):
+        # type: (Table) -> None
+        """
+        Creates a table.
 
         Args:
-            table: The BQ table object to representing the table to create.
-            max_tries: The maximum number of times to try calling the API before giving up. Defaults
-                to self.default_max_api_call_tries.
+            table: The Table or TableReference object to create. Note that if you pass a
+                TableReference the table will be created with no schema.
         """
-        max_tries = max_tries or self.default_max_api_call_tries
-        return execute_with_retries(lambda: table.create(), max_tries)
+        if isinstance(table, TableReference):
+            # Normally you'd pass in the schema here upon Table instantiation
+            table = Table(table)
 
-    def reload_dataset(self, dataset, max_tries=None):
-        # type: (dataset) -> None
-        """Reloads a dataset.
+        self.gclient.create_table(table)
+
+    def fetch_data_from_table(self,
+                              table  # type: Union[Table, TableReference]
+                              ):
+        # type: (...) -> List[Tuple[Any]]
+        """
+        Fetches data from the given table.
 
         Args:
-            dataset: The BQ dataset object to reload.
-            max_tries: The maximum number of times to try calling the API before giving up. Defaults
-                to self.default_max_api_call_tries.
-        """
-        max_tries = max_tries or self.default_max_api_call_tries
-        return execute_with_retries(lambda: dataset.reload(), max_tries)
+            table: The Table or TableReference object representing the table from which
+                to fetch data.
 
-    def reload_table(self, table, max_tries=None):
-        # type: (table) -> None
-        """Reloads a table.
-
-        Args:
-            table: The BQ table object to reload.
-            max_tries: The maximum number of times to try calling the API before giving up. Defaults
-                to self.default_max_api_call_tries.
-        """
-        max_tries = max_tries or self.default_max_api_call_tries
-        return execute_with_retries(lambda: table.reload(), max_tries)
-
-    def fetch_data_from_table(self, table, max_tries=None):
-        # type: (table) -> List[tuple]
-        """Fetches data from the given table.
-
-        Args:
-            table: The BQ table object representing the table from which to fetch data.
-            max_tries: The maximum number of times to try calling the API before giving up. Defaults
-                to self.default_max_api_call_tries.
         Returns:
             List of tuples, where each tuple is a row of the table.
         """
-        max_tries = max_tries or self.default_max_api_call_tries
-        return execute_with_retries(lambda: list(table.fetch_data()), max_tries)
+        return self.get_query_results('SELECT * FROM `{}`'.format(table.table_id))

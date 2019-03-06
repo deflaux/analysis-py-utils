@@ -1,4 +1,4 @@
-# Copyright 2017 Verily Life Sciences Inc. All Rights Reserved.
+# Copyright 2019 Verily Life Sciences Inc. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,14 +17,17 @@ from setuptools import find_packages
 from setuptools import setup
 
 REQUIRED_PACKAGES = ['pandas',
-                     'google-cloud==0.27.0',
+                     'google-api-core==1.6.0',
+                     'google-auth==1.4.1',
+                     'google-cloud-bigquery==1.8.0',
+                     'google-cloud-storage==1.13.1',
                      'pysqlite>=2.8.3',
                      'ddt',
                      'typing']
 
 setup(
     name='analysis-py-utils',
-    version='0.1',
+    version='0.4.0',
     license='Apache 2.0',
     author='Verily Life Sciences',
     url='https://github.com/verilylifesciences/analysis-py-utils',
@@ -32,4 +35,5 @@ setup(
     packages=find_packages(),
     include_package_data=True,
     description='Python utilities for data analysis.',
+    scripts=['setup_pysqlite.sh'],
     requires=[])
